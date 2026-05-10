@@ -1,0 +1,29 @@
+# Template directory
+DC_GTC_Report_Template_for_M_S___Ph_D__students_IIT_Madras__4_ (1)/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.nav
+*.snm
+*.vrb
+*.lof
+*.lot
+*.idx
+*.ilg
+*.ind
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
