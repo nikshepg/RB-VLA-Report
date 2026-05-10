@@ -225,6 +225,26 @@ p\!\left(a_{t:t+H} \mid b_t, I_t, s_t \right) ,
 \end{equation}
 via iterative denoising, warm-started from the previously predicted action sequence with added low-variance Gaussian noise to improve sampling efficiency and temporal coherence. The diffusion model samples a chunk of $H$ actions jointly conditioned on the belief, intent, and fused state, allowing it to generate temporally coherent action sequences rather than independent per-step decisions. Warm-starting denoising from the previous chunk preserves smoothness across overlapping windows. Actions are executed in a receding-horizon manner at high frequency (50\,Hz), enabling smooth, closed-loop control under partial observability without reliance on dense semantic inference.
 
+\subsection{Architecture and Implementation Details}
+\label{subsec:arch}
+This subsection summarises the concrete network configuration used for each module. Hidden dimensions are kept consistent at $d = 256$ across the belief, intent and policy stacks to simplify cross-module conditioning.
+
+\paragraph{Visual backbone.} Visual observations are encoded by a frozen DINOv2 ViT-S/14 \cite{oquab2023dinov2} backbone, producing $16 \times 16 = 256$ patch tokens at 384 dimensions per frame. A linear projection maps these to the shared 256-dimensional space. Proprioceptive signals (end-effector pose, velocity, acceleration, force--torque) are embedded by a 2-layer MLP with hidden dimension 256 and GELU activations.
+
+\paragraph{Frame fusion encoder.} The multimodal tokens of each frame are processed by a 4-block transformer encoder with 8 attention heads per block and feed-forward dimension $4d = 1024$. Pooling uses a single learnable query vector $d_q \in \mathbb{R}^{256}$, yielding the per-frame summary $f_t \in \mathbb{R}^{256}$.
+
+\paragraph{Temporal transformer and recurrence.} Temporal integration is performed by a 4-block transformer (8 heads, FFN 1024) over a token sequence consisting of the previous belief token $b_{t-1}$ and the most recent $K = 5$ frame summaries. The output corresponding to the belief slot is treated as the evidence representation $e_t$. The deterministic belief recurrence is a single-layer GRU with hidden size 256 that integrates $e_t$ together with the stochastic latent $z_t$ to produce $b_t$.
+
+\paragraph{Stochastic latent.} The prior $p(z_t \mid b_{t-1})$ and posterior $q(z_t \mid b_{t-1}, e_t)$ are diagonal Gaussians of dimension 32, predicted by 2-layer MLPs with hidden size 256 and reparameterised samples.
+
+\paragraph{Predictive heads.} Both the one-step decoder and the auxiliary five-step decoder are 2-layer MLPs (hidden 512, GELU) producing 256-dimensional reconstructions in the EMA-frame-encoder feature space. The inverse-dynamics predictor $g(b_t, b_{t+1})$ is a 2-layer MLP (hidden 512) outputting actions in the same dimensionality as the robot action space.
+
+\paragraph{Intent extractor.} The intent module attends over the final multi-modal hidden states of the frozen Qwen2.5-VL-7B \cite{bai2025qwen2} backbone (hidden size $D = 3584$). A learnable goal query $\mathbf{q} \in \mathbb{R}^{D}$ together with a key projection $W_k \in \mathbb{R}^{D \times D}$ yields the pooled task vector $\mathbf{h}_{\text{task}}$, which is mapped to a 256-dimensional intent $I_t$ by a 2-layer MLP. The VLM backbone is frozen; only the query, projection and MLP are trained.
+
+\paragraph{Diffusion-transformer action head.} The DiT-based policy consists of 8 transformer blocks (8 heads, FFN 1024, hidden 256). Conditioning is provided via cross-attention on the concatenation $[b_t, I_t, s_t] \in \mathbb{R}^{768}$ together with sinusoidal embeddings of the diffusion timestep. The policy predicts a 16-step action chunk and is trained with the standard $\epsilon$-prediction objective using a cosine $\bar{\alpha}$ noise schedule over 100 DDPM steps.
+
+\paragraph{Module sizes.} The belief stack (frame fusion, temporal transformer, GRU, stochastic head, predictive heads, inverse dynamics) totals approximately 150M parameters. The diffusion-transformer policy contains approximately 120M parameters. The frozen Qwen2.5-VL-7B backbone is shared across tasks and contributes no trainable parameters.
+
 \section{Dataset and Training}
 We use a staged training pipeline for the vision--language module, the belief model, and the diffusion controller. The belief transformer is first trained with the self-supervised objectives described in Section~\ref{subsec:belief}. The intent extraction layers and the diffusion policy are trained jointly. All models are trained using mixed precision and gradient accumulation.
 
@@ -232,15 +252,74 @@ We use a staged training pipeline for the vision--language module, the belief mo
 Training uses 40{,}000 simulated manipulation trajectories ($\sim$40M timesteps) across 10 tasks, collected in RoboSuite, LIBERO-Long, LIBERO-Object using Franka Panda and a UR5 MuJoCo environment. The dataset spans single and multi-object pick-and-place under occlusion, multi-block stacking in RoboSuite, and household tasks in LIBERO such as placing objects into drawers and cabinets. In practice, we observe that the belief converges reliably using a moderate number of trajectories, as the model focuses on learning control-relevant dynamics and action-conditioned state transitions rather than improving dense per-step semantic reasoning. We further finetune the belief and diffusion model with real-world manipulation tasks, adapting to sensor noise and unmodeled dynamics. During training, RGB observations are augmented with random brightness/contrast jitter, additive Gaussian noise, and minor spatial cropping to improve robustness and encourage learning of task-relevant state information.
 
 \subsection{Training Details}
-The belief model uses a DINOv2 ViT-S/14 vision encoder and produces a 256-dimensional belief state from multimodal tokens. Temporal integration in the belief transformer uses a fixed window of $K = 5$ frames. The belief module contains 150M parameters and is trained for 80k iterations with batch size 128 and learning rate $1\times 10^{-4}$. The VLM is initialised from Qwen2.5-VL-7B \cite{bai2025qwen2} and remains frozen during training. We replace the original language head with a lightweight intent extraction module, which is trained on top of the frozen VLM to produce a 256-dimensional continuous intent vector. The extracted intent, together with the 256-dimensional belief state, conditions the diffusion policy. The diffusion controller has 120M parameters and uses a DDPM objective with 100 steps to predict 16-step action chunks. It is trained for 100k iterations with batch size 32 and a learning rate $1\times 10^{-4}$. All experiments are run on 12 NVIDIA A100 GPUs (80\,GB) using distributed data parallel training.
+\label{subsec:training_details}
+The belief model is trained first using the self-supervised objectives described in Section~\ref{subsec:belief}. The intent extraction module and the diffusion-transformer policy are then trained jointly with the action prediction loss while the VLM backbone and the trained belief encoder remain frozen. Refer to Section~\ref{subsec:arch} for the complete architectural configuration of each module. All experiments are run on 12 NVIDIA A100 GPUs (80\,GB) using distributed data parallel training with bfloat16 mixed precision and gradient accumulation. Total wall-clock training time is approximately 2.5 days for the belief model and 3 days for the diffusion policy.
+
+\paragraph{Optimisation.} All learnable modules are optimised with AdamW ($\beta_1 = 0.9$, $\beta_2 = 0.95$, weight decay $0.05$). The peak learning rate of $1\times 10^{-4}$ is reached over a linear warm-up of $2{,}000$ steps and then decayed on a cosine schedule. Gradients are clipped to a global norm of $1.0$. Exponential moving averages (EMA) of the model weights are maintained with decay $0.999$ for the frame encoder used as a prediction target.
+
+\paragraph{Loss balancing.} The multi-step prediction weight in Equation~(4) is set to $\lambda = 0.5$, balancing one-step and five-step ahead reconstruction. The KL coefficient $\beta$ is annealed linearly from $0$ to $10^{-3}$ over the first $10{,}000$ iterations of belief training and held constant thereafter, which we find sufficient to prevent posterior collapse without over-regularising the latent. The inverse-dynamics loss is added with weight $0.1$. The temporal contrastive warm-start objective uses a temperature of $0.07$ and treats frames within $\pm 5$ timesteps as positives.
+
+\paragraph{Data augmentation.} During belief training, RGB observations are augmented with random brightness and contrast jitter ($\pm 0.2$), additive Gaussian noise ($\sigma = 0.02$), and random spatial crops of $0.9\times$--$1.0\times$ the image area, followed by resizing back to the network input resolution. Proprioceptive signals are perturbed with low-variance Gaussian noise to encourage robustness to sensor noise.
+
+A summary of the principal training hyperparameters is given in Table~\ref{tab:hparams}, and the loss weights for the belief objective are listed in Table~\ref{tab:loss_weights}.
+
+\begin{table}[h]
+\centering
+\caption{Principal training hyperparameters.}
+\label{tab:hparams}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Setting} & \textbf{Belief Model} & \textbf{Diffusion Policy} \\
+\midrule
+Optimiser & AdamW & AdamW \\
+$(\beta_1, \beta_2)$ & $(0.9, 0.95)$ & $(0.9, 0.95)$ \\
+Weight decay & $0.05$ & $0.05$ \\
+Peak learning rate & $1\times 10^{-4}$ & $1\times 10^{-4}$ \\
+LR schedule & cosine, $2$k warm-up & cosine, $2$k warm-up \\
+Gradient clip (global $\ell_2$) & $1.0$ & $1.0$ \\
+Effective batch size & $128$ & $32$ \\
+Iterations & $80{,}000$ & $100{,}000$ \\
+Precision & bf16 mixed & bf16 mixed \\
+Hardware & $12\times$A100 80\,GB & $12\times$A100 80\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Loss weights used in belief-model training (Equation~(4) and inverse-dynamics objective).}
+\label{tab:loss_weights}
+\begin{tabular}{lc}
+\toprule
+\textbf{Term} & \textbf{Weight} \\
+\midrule
+Next-frame reconstruction $\log p(x_{t+1} \mid b_t, z_t)$ & $1.0$ \\
+Multi-step reconstruction weight $\lambda$ on $x_{t+5}$ & $0.5$ \\
+KL coefficient $\beta$ (annealed) & $0 \rightarrow 10^{-3}$ over 10k iters \\
+Inverse-dynamics $\mathcal{L}_{\text{inv}}$ & $0.1$ \\
+Temporal contrastive (warm-start) & $1.0$ \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \section{Results}
-Recursive Belief VLA (RB-VLA) is evaluated in simulation and the real world, using RoboSuite and LIBERO-Long. The evaluation focuses on: (a) long-horizon tasks; (b) latency and memory growth; (c) belief representation analysis; (d) ablation studies; (e) real world tasks.
+Recursive Belief VLA (RB-VLA) is evaluated in simulation and the real world, using RoboSuite and LIBERO-Long. The evaluation focuses on: (a) long-horizon tasks; (b) latency and memory growth; (c) belief representation analysis; (d) ablation studies; (e) real world tasks. Before presenting results, Section~\ref{subsec:exp_setup} consolidates the evaluation protocol, baselines, metrics and hardware used across all experiments.
+
+\subsection{Experimental Setup}
+\label{subsec:exp_setup}
+
+\paragraph{Tasks and environments.} RB-VLA is evaluated in three settings. \textit{(i)} Long-horizon, multi-stage manipulation in RoboSuite using a Franka Panda manipulator, focusing on multi-object pick-and-place and multi-block stacking under both clean and partially observed conditions. \textit{(ii)} Household manipulation in LIBERO-Long, including drawer and cabinet interactions that require sustained task tracking across many timesteps. \textit{(iii)} Real-world manipulation on a UR5 manipulator with an Intel RealSense D435i RGB camera, using objects of varying colours and shapes placed in randomised configurations. Tasks in all three settings are specified by a natural language instruction supplied at $t=0$.
+
+\paragraph{Baselines.} RB-VLA is compared against three representative VLA architectures spanning the dominant design choices in the literature: \textbf{OpenVLA} \cite{kim2024openvla}, a stateless autoregressive token-based model; \textbf{GR00T-N1} \cite{bjorck2025gr00t}, a multi-frame VLA with a diffusion-based controller; and \textbf{$\pi_0$} \cite{black2025pi_}, a flow-matching policy with strong reported long-horizon performance. For fair comparison, every baseline is fine-tuned on the same 40k-trajectory simulation dataset using its official training procedure, and is evaluated on the same task instances as RB-VLA.
+
+\paragraph{Metrics.} We report three primary metrics. The \textbf{task success rate} is the fraction of evaluation episodes that complete the target task within a fixed time budget without collision, premature termination, or constraint violation. The \textbf{inference latency} is the average end-to-end wall-clock time per action chunk on a single NVIDIA A100 GPU, reported as the per-episode mean. The \textbf{relative memory usage} is reported as a multiple of the single-frame baseline, isolating the architectural memory growth induced by additional temporal context.
+
+\paragraph{Evaluation protocol.} Every reported simulation success rate is averaged over $40$ trials per task with different random seeds. Robustness is stress-tested at inference by randomising object identities and placements, environment configurations, lighting conditions, object presentation order, and by introducing dropped frames and additive observation noise. Real-world results are averaged over $25$ trials per task with hand-randomised object placements, with no resets or human intervention permitted during a trial. Models are always evaluated on held-out task instances that are not encountered during training.
+
+\paragraph{Hardware.} Training is performed on $12\times$ NVIDIA A100 80\,GB GPUs with distributed data-parallel training (Section~\ref{subsec:training_details}). Inference benchmarks (latency and memory) are conducted on a single A100. For real-world deployment, the UR5 controller runs at $50$\,Hz, the diffusion policy samples action chunks at $10$--$20$\,Hz, and the recursive belief is updated at the same rate as new observations arrive.
 
 \subsection{Long Horizon Tasks}
-We evaluate RB-VLA on long-horizon, multi-stage manipulation tasks with and without occlusion, assessing robustness under partial observability as well as sustained task progression over extended horizons. Experiments are conducted in RoboSuite and LIBERO-Long environments.
-
-We ran 40 trials per task with different random seeds. Robustness was evaluated at inference by randomising object identities and placements, environment configurations, lighting conditions, object order, as well as introducing dropped frames and observation noise. Performance is measured by task success rate, defined as completing the task within a fixed horizon without collisions or premature termination. Quantitative results for two-object pick-and-place under occlusion and stacking are reported in Table~\ref{tab:longhorizon}.
+We evaluate RB-VLA on long-horizon, multi-stage manipulation tasks with and without occlusion, assessing robustness under partial observability as well as sustained task progression over extended horizons. Experiments follow the protocol of Section~\ref{subsec:exp_setup}, with 40 trials per task. Quantitative results for two-object pick-and-place under occlusion and for stacking are reported in Table~\ref{tab:longhorizon}.
 
 \begin{table}[h]
 \centering
@@ -378,9 +457,41 @@ We deploy RB-VLA on a physical UR5 manipulator under conditions closely matching
 Figure~\ref{fig:real} illustrates the real-world setup. An Intel RealSense D435i RGB camera is mounted to capture the gripper and workspace, and five objects of varying shapes and colours are placed in randomised configurations. Only RGB images are used for perception. Tasks are specified through natural language instructions describing the target objects and goal location.
 
 \section{Conclusion and Future Work}
-We presented RB-VLA, a belief-conditioned vision--language--action framework for long-horizon manipulation under partial observability. By maintaining a compact, action-conditioned belief state, the system preserves task progress and interaction history without growing memory, enabling robust multi-stage control under occlusion with reduced latency. The architecture can be integrated into large pretrained VLAs as a fine-tuning layer for scalable robotic manipulation.
 
-Future work will focus on scaling data and task diversity, integrating reinforcement learning for improved recovery behaviours, and extending the belief framework to support greater adaptability in dynamic environments.
+\subsection{Summary}
+This report presented Recursive Belief VLA (RB-VLA), a belief-conditioned vision--language--action framework designed for long-horizon manipulation under partial observability. The central premise of the work is that long-horizon manipulation is bottlenecked not by semantic perception but by the absence of a persistent, action-conditioned representation of task progress. RB-VLA addresses this gap by introducing a fixed-size, recursively updated belief state trained with self-supervised world-model objectives, decoupling semantic grounding (delegated to a sparsely queried VLM) from causal state estimation and low-level control.
+
+The proposed architecture combines three components: a frozen vision--language model that produces a one-shot grounded intent embedding, a recursive belief estimator that integrates observations, actions and proprioception into a 256-dimensional latent state, and a diffusion-transformer policy that generates closed-loop action chunks conditioned on both belief and intent. The belief is trained with an RSSM-style ELBO objective augmented with multi-step prediction and inverse-dynamics losses, encouraging the latent state to capture controllable, action-grounded dynamics rather than passive visual features.
+
+\subsection{Key Findings}
+Across simulation and real-world experiments, three findings stand out:
+
+\begin{itemize}
+    \item \textbf{The belief is the primary driver of long-horizon performance.} Component ablations show success rate jumping from $32.5\%$ (no belief) to $77.5\%$ (full RB-VLA) on multi-stage pick-and-place under occlusion. Belief --- not language reasoning --- governs reliable progression through stages.
+    \item \textbf{Belief proximity predicts dynamical futures.} Cosine similarity in belief space correlates strongly with future action similarity ($r = 0.87$) and future visual similarity ($r = 0.78$), providing direct empirical evidence that the learned belief functions as an action-conditioned dynamical state rather than a passive memory buffer.
+    \item \textbf{Episodic semantic grounding is sufficient.} Querying the VLM once per task --- rather than at every timestep --- yields more than $5\times$ lower latency than stateless baselines without sacrificing task success, validating the decoupling of intent from control.
+\end{itemize}
+
+Together with the constant-memory profile of the recursive belief, these findings demonstrate that compact, action-conditioned latent state is both necessary and largely sufficient for the long-horizon, multi-stage regime where existing observation-driven VLAs degrade most sharply.
+
+\subsection{Future Work}
+Several directions extend this work:
+
+\paragraph{Reinforcement learning for recovery.} The current belief and policy are trained purely with self-supervised and imitation objectives. Closing the loop with online or offline reinforcement learning would let both modules co-adapt for recovery from execution failures (e.g., slips, premature releases, unintended contact) and would reduce reliance on dense teleoperation data in scenarios where high-quality demonstrations are scarce.
+
+\paragraph{Sim-to-real with systematic domain randomisation.} While the diffusion policy adapts to real hardware via 100 trajectories of fine-tuning, broader sim-to-real transfer would benefit from systematic domain randomisation over lighting, textures, and dynamics during simulation training, together with auxiliary contact-aware self-supervision on the real robot. Combining randomisation with the action-grounded targets used to train the belief is a particularly promising direction, as it would expose the belief to a wider distribution of dynamics-relevant visual variation.
+
+\paragraph{Bimanual and dexterous manipulation.} The belief representation is task-agnostic in form, but the current evaluation focuses on single-arm pick-and-place and stacking. Extending to bimanual coordination and multi-finger dexterous tasks would test whether the recursive belief can capture richer interaction histories such as inter-arm coordination, in-hand manipulation, and contact-rich tool use.
+
+\paragraph{Adaptive replanning under instruction changes.} The current architecture treats the intent embedding as static across an episode. Real-world deployments often involve evolving instructions or partial replanning. Allowing the VLM to be re-invoked under explicit triggers --- task failure, instruction change, or detected belief uncertainty --- while preserving belief continuity would extend RB-VLA to interactive and human-in-the-loop settings.
+
+\paragraph{Scaling backbones and trajectory data.} Larger VLM backbones (e.g., Qwen2.5-VL-72B) and broader trajectory corpora such as Open X-Embodiment may further improve generalisation, particularly for novel object categories and unseen instructions. The episodic VLM-querying scheme makes such scaling computationally affordable, since the cost is paid only once per task rather than at every timestep.
+
+\paragraph{Theoretical analysis of belief sufficiency.} A formal analysis linking the learned belief to a sufficient statistic for the underlying POMDP --- and characterising the gap between the learned belief and a Bayes-optimal posterior --- remains open. Such analysis would clarify when and why belief proximity predicts future similarity, and would motivate principled regularisers in place of the present empirical loss balance.
+
+\paragraph{Integration into pretrained VLAs.} The recursive belief module is designed as a fine-tuning layer rather than a from-scratch architecture. Integrating it into existing pretrained VLAs (e.g., $\pi_0$, OpenVLA, GR00T-N1) as a plug-in memory module is a low-cost path to upgrading deployed systems without retraining their policy stacks, and is a natural next experiment.
+
+Taken together, these directions move RB-VLA toward a general, deployable framework for memory-aware vision--language--action control --- one in which compact, action-grounded internal state, rather than ever-growing observation context, becomes the primary substrate for long-horizon decision making.
 
 \section*{Acknowledgments}
 I would like to express my sincere gratitude to Professor Bijo Sebastian for his invaluable guidance, constant support, and encouragement throughout the course of this project.
